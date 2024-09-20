@@ -1,0 +1,120 @@
+// Copyright (c) 2024 Magic Tech Ltd
+
+package fit.magic.cv.repcounter
+
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+import fit.magic.cv.PoseLandmarkerHelper
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.max
+import kotlin.math.min
+
+
+class ExerciseRepCounterImpl : ExerciseRepCounter() {
+
+    private var stage = "down"
+    private var lockedAngle: Float? = null
+    private val ANGLE_THRESHOLD = 5f
+    private val alpha = 0.4f
+    private val smoothedLandmarks = mutableMapOf<Int, NormalizedLandmark>()
+
+    override fun setResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+        val poseLandmarkerResult = resultBundle.results.firstOrNull()
+
+        if (poseLandmarkerResult == null || poseLandmarkerResult.landmarks().isEmpty()) {
+            sendFeedbackMessage("No pose detected")
+            return
+        }
+
+        try {
+            val smoothedLandmarks = smoothLandmarks(poseLandmarkerResult.landmarks()[0])
+            val landmarkDict = convertLandmarksToDictionary(smoothedLandmarks)
+            val angle = extractAngle(landmarkDict)
+            processAngle(angle)
+        } catch (e: Exception) {
+            sendFeedbackMessage("Error processing pose: ${e.message}")
+            return
+        }
+    }
+
+    private fun convertLandmarksToDictionary(landmarks: List<NormalizedLandmark>): Map<String, NormalizedLandmark> {
+        val landmarkDict = mutableMapOf<String, NormalizedLandmark>()
+        val landmarkNames = listOf("RIGHT_SHOULDER", "RIGHT_HIP", "RIGHT_KNEE")
+        val landmarkIndices = listOf(12, 24, 26)  // Indices for right shoulder, right hip, right knee
+
+        for ((name, index) in landmarkNames.zip(landmarkIndices)) {
+            if (index < landmarks.size) {
+                landmarkDict[name] = landmarks[index]
+            } else {
+                throw IllegalStateException("Landmark index $index is out of bounds")
+            }
+        }
+
+        return landmarkDict
+    }
+
+    private fun smoothLandmarks(landmarks: List<NormalizedLandmark>): List<NormalizedLandmark> {
+        return landmarks.mapIndexed { index, landmark ->
+            if (index !in smoothedLandmarks) {
+                smoothedLandmarks[index] = landmark
+            } else {
+                smoothedLandmarks[index] = NormalizedLandmark.create(
+                    alpha * landmark.x() + (1 - alpha) * smoothedLandmarks[index]!!.x(),
+                    alpha * landmark.y() + (1 - alpha) * smoothedLandmarks[index]!!.y(),
+                    alpha * landmark.z() + (1 - alpha) * smoothedLandmarks[index]!!.z(),
+                    landmark.presence(),
+                    landmark.visibility()
+                )
+            }
+            smoothedLandmarks[index]!!
+        }
+    }
+
+    private fun extractAngle(landmarkDict: Map<String, NormalizedLandmark>): Float {
+        return calculateAngle(
+            landmarkDict["RIGHT_SHOULDER"]!!,
+            landmarkDict["RIGHT_HIP"]!!,
+            landmarkDict["RIGHT_KNEE"]!!
+        )
+    }
+
+    private fun calculateAngle(a: NormalizedLandmark, b: NormalizedLandmark, c: NormalizedLandmark): Float {
+        val radians = atan2(c.y() - b.y(), c.x() - b.x()) - atan2(a.y() - b.y(), a.x() - b.x())
+        var angle = abs(radians * 180f / PI.toFloat())
+        if (angle > 180f) {
+            angle = 360f - angle
+        }
+        return angle
+    }
+
+    private fun processAngle(angle: Float) {
+        // Lock-in logic
+        if (lockedAngle == null || abs(angle - lockedAngle!!) > ANGLE_THRESHOLD) {
+            lockedAngle = angle
+        }
+
+        // Rep counter logic
+        if (lockedAngle!! < 160) {
+            stage = "down"
+        } else if (lockedAngle!! > 170 && stage == "down") {
+            stage = "up"
+            incrementRepCount()
+        }
+
+        // Update progress
+        val normalizedAngle = max(0f, min((230f - lockedAngle!!) / 80f, 1f))
+        sendProgressUpdate(normalizedAngle)
+
+        // Send feedback
+        provideFeedback(lockedAngle!!)
+    }
+
+    private fun provideFeedback(angle: Float) {
+        when {
+            angle < 160 -> sendFeedbackMessage("Lower your hips")
+            angle in 160f..170f -> sendFeedbackMessage("Good form, keep going!")
+            angle > 170 -> sendFeedbackMessage("Great extension! Lower your hips for the next rep")
+        }
+    }
+}
